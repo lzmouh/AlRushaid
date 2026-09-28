@@ -1,94 +1,254 @@
+"""
+Invoice OCR database for photographed restaurant invoices.
 
-import io
+Designed around receipts like the supplied sample:
+- English text is extracted; Arabic text is ignored.
+- Multiple photos are loaded in one upload action.
+- Images are processed ONE AT A TIME.
+- After each image is processed, the SQLite database is updated and the
+  invoice date / total summary table is refreshed immediately.
+- No Tesseract is required.
+"""
+
+from __future__ import annotations
+
+import hashlib
+import json
 import re
-import zipfile
+import sqlite3
 from datetime import datetime
 from pathlib import Path
+from typing import Any
 
 import cv2
 import numpy as np
 import pandas as pd
 import streamlit as st
-from PIL import Image, ImageOps, ImageEnhance
-import pytesseract
-import shutil
-import os
-
-# Optional PDF support
-try:
-    import fitz  # PyMuPDF
-    PDF_AVAILABLE = True
-except ImportError:
-    PDF_AVAILABLE = False
-
-
-st.set_page_config(
-    page_title="Restaurant Invoice Consolidator",
-    page_icon="🧾",
-    layout="wide",
-)
-
-st.title("🧾 Restaurant Invoice Consolidator")
-st.caption(
-    "Upload multiple restaurant invoices at once. The app OCRs each invoice, "
-    "extracts the transaction fields and calculates year-to-date subtotals and totals."
-)
+from PIL import Image
+from rapidocr_onnxruntime import RapidOCR
 
 
 # ---------------------------------------------------------------------
-# OCR / image preparation
+# Configuration
 # ---------------------------------------------------------------------
 
-def configure_tesseract():
-    candidates = [
-        os.environ.get("TESSERACT_CMD"),
-        shutil.which("tesseract"),
-        "/usr/bin/tesseract",
-        "/usr/local/bin/tesseract",
-    ]
+APP_DIR = Path(__file__).resolve().parent
+DATA_DIR = APP_DIR / "data"
+IMAGE_DIR = DATA_DIR / "invoice_images"
+DB_PATH = DATA_DIR / "invoices.db"
 
-    for candidate in candidates:
-        if candidate and Path(candidate).exists():
-            pytesseract.pytesseract.tesseract_cmd = candidate
-            return candidate
-
-    return None
+DATA_DIR.mkdir(parents=True, exist_ok=True)
+IMAGE_DIR.mkdir(parents=True, exist_ok=True)
 
 
-TESSERACT_PATH = configure_tesseract()
+# ---------------------------------------------------------------------
+# OCR engine
+# ---------------------------------------------------------------------
 
-if not TESSERACT_PATH:
-    st.error(
-        "Tesseract OCR is not installed. "
-        "For Streamlit Community Cloud, make sure the project contains "
-        "a packages.txt file with 'tesseract-ocr' and 'tesseract-ocr-ara', "
-        "then redeploy/reboot the app."
-    )
-    st.stop()
+@st.cache_resource
+def get_ocr_engine():
+    """Load OCR models once per Streamlit process."""
+    return RapidOCR()
 
 
-def preprocess_image(image: Image.Image) -> Image.Image:
-    """Prepare a receipt image for OCR."""
-    img = image.convert("RGB")
+# ---------------------------------------------------------------------
+# Database
+# ---------------------------------------------------------------------
 
-    # Upscale narrow thermal receipts.
-    scale = max(1.0, 1800 / max(img.width, 1))
-    if scale > 1:
-        img = img.resize(
-            (int(img.width * scale), int(img.height * scale)),
-            Image.Resampling.LANCZOS,
+def init_db() -> None:
+    with sqlite3.connect(DB_PATH) as con:
+        con.execute(
+            """
+            CREATE TABLE IF NOT EXISTS invoices (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                file_hash TEXT UNIQUE NOT NULL,
+                file_name TEXT NOT NULL,
+                processed_at TEXT NOT NULL,
+
+                invoice_date TEXT,
+                printed_at TEXT,
+                merchant TEXT,
+                vat_number TEXT,
+                order_number TEXT,
+                check_number TEXT,
+                customer TEXT,
+                creator TEXT,
+                closer TEXT,
+
+                subtotal REAL,
+                vat_rate REAL,
+                vat_amount REAL,
+                total_amount REAL,
+                payment_method TEXT,
+                products_count INTEGER,
+
+                items_json TEXT,
+                raw_ocr_text TEXT,
+                ocr_confidence REAL,
+
+                status TEXT NOT NULL,
+                error_message TEXT
+            )
+            """
         )
 
-    # Grayscale + contrast enhancement.
-    gray = ImageOps.grayscale(img)
-    gray = ImageEnhance.Contrast(gray).enhance(2.0)
-    gray = ImageEnhance.Sharpness(gray).enhance(1.5)
 
-    # OpenCV adaptive thresholding works well with photographed receipts.
-    arr = np.array(gray)
-    arr = cv2.GaussianBlur(arr, (3, 3), 0)
-    threshold = cv2.adaptiveThreshold(
-        arr,
+def save_invoice(record: dict[str, Any]) -> bool:
+    """Insert one invoice. Returns False if the same file hash already exists."""
+    columns = [
+        "file_hash", "file_name", "processed_at",
+        "invoice_date", "printed_at", "merchant", "vat_number",
+        "order_number", "check_number", "customer", "creator", "closer",
+        "subtotal", "vat_rate", "vat_amount", "total_amount",
+        "payment_method", "products_count", "items_json", "raw_ocr_text",
+        "ocr_confidence", "status", "error_message",
+    ]
+
+    placeholders = ",".join(["?"] * len(columns))
+    values = [record.get(c) for c in columns]
+
+    with sqlite3.connect(DB_PATH) as con:
+        cur = con.execute(
+            f"""
+            INSERT OR IGNORE INTO invoices ({",".join(columns)})
+            VALUES ({placeholders})
+            """,
+            values,
+        )
+        return cur.rowcount == 1
+
+
+def load_summary() -> pd.DataFrame:
+    with sqlite3.connect(DB_PATH) as con:
+        return pd.read_sql_query(
+            """
+            SELECT
+                id AS "#",
+                file_name AS "Photo",
+                invoice_date AS "Invoice Date",
+                total_amount AS "Total Amount",
+                vat_amount AS "VAT",
+                status AS "Status"
+            FROM invoices
+            ORDER BY id DESC
+            """,
+            con,
+        )
+
+
+# ---------------------------------------------------------------------
+# Image preprocessing
+# ---------------------------------------------------------------------
+
+def order_points(pts: np.ndarray) -> np.ndarray:
+    rect = np.zeros((4, 2), dtype=np.float32)
+    s = pts.sum(axis=1)
+    d = np.diff(pts, axis=1).ravel()
+
+    rect[0] = pts[np.argmin(s)]   # top-left
+    rect[2] = pts[np.argmax(s)]   # bottom-right
+    rect[1] = pts[np.argmin(d)]   # top-right
+    rect[3] = pts[np.argmax(d)]   # bottom-left
+    return rect
+
+
+def four_point_warp(image: np.ndarray) -> np.ndarray:
+    """
+    Try to detect the receipt as the largest quadrilateral.
+    If detection is unreliable, return the original image.
+    """
+    h, w = image.shape[:2]
+    scale = 1200.0 / max(h, w)
+    small = cv2.resize(image, None, fx=scale, fy=scale) if scale < 1 else image.copy()
+
+    gray = cv2.cvtColor(small, cv2.COLOR_BGR2GRAY)
+    blur = cv2.GaussianBlur(gray, (5, 5), 0)
+    edges = cv2.Canny(blur, 50, 150)
+
+    contours, _ = cv2.findContours(
+        edges, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
+    )
+
+    image_area = small.shape[0] * small.shape[1]
+    candidates = []
+
+    for c in contours:
+        area = cv2.contourArea(c)
+        if area < image_area * 0.10:
+            continue
+
+        peri = cv2.arcLength(c, True)
+        approx = cv2.approxPolyDP(c, 0.02 * peri, True)
+
+        if len(approx) == 4:
+            candidates.append((area, approx.reshape(4, 2)))
+
+    if not candidates:
+        return image
+
+    _, pts = max(candidates, key=lambda x: x[0])
+
+    # Convert coordinates back to original image.
+    if scale < 1:
+        pts = pts / scale
+
+    rect = order_points(pts)
+    tl, tr, br, bl = rect
+
+    width_a = np.linalg.norm(br - bl)
+    width_b = np.linalg.norm(tr - tl)
+    height_a = np.linalg.norm(tr - br)
+    height_b = np.linalg.norm(tl - bl)
+
+    max_width = int(max(width_a, width_b))
+    max_height = int(max(height_a, height_b))
+
+    if max_width < 300 or max_height < 300:
+        return image
+
+    dst = np.array(
+        [
+            [0, 0],
+            [max_width - 1, 0],
+            [max_width - 1, max_height - 1],
+            [0, max_height - 1],
+        ],
+        dtype=np.float32,
+    )
+
+    matrix = cv2.getPerspectiveTransform(rect.astype(np.float32), dst)
+    warped = cv2.warpPerspective(image, matrix, (max_width, max_height))
+
+    return warped
+
+
+def make_ocr_variants(image: np.ndarray) -> list[np.ndarray]:
+    """
+    Produce several OCR-friendly versions.
+    The OCR engine will be run sequentially on these variants.
+    """
+    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+
+    # Improve local contrast.
+    clahe = cv2.createCLAHE(clipLimit=2.2, tileGridSize=(8, 8))
+    contrast = clahe.apply(gray)
+
+    # Upscaling is important for small receipt characters.
+    scale = 2.5
+    up_gray = cv2.resize(
+        gray, None, fx=scale, fy=scale, interpolation=cv2.INTER_CUBIC
+    )
+    up_contrast = cv2.resize(
+        contrast, None, fx=scale, fy=scale, interpolation=cv2.INTER_CUBIC
+    )
+
+    # Gentle sharpening.
+    kernel = np.array([[0, -1, 0], [-1, 5, -1], [0, -1, 0]], dtype=np.float32)
+    sharp = cv2.filter2D(up_contrast, -1, kernel)
+
+    # Adaptive threshold helps thermal-paper receipts.
+    adaptive = cv2.adaptiveThreshold(
+        up_contrast,
         255,
         cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
         cv2.THRESH_BINARY,
@@ -96,710 +256,532 @@ def preprocess_image(image: Image.Image) -> Image.Image:
         11,
     )
 
-    return Image.fromarray(threshold)
-
-
-def ocr_image(image: Image.Image) -> str:
-    """Run OCR. English is always attempted; Arabic is used if installed."""
-    processed = preprocess_image(image)
-
-    # Use English + Arabic when Arabic Tesseract data is available.
-    try:
-        langs = pytesseract.get_languages(config="")
-    except Exception:
-        langs = ["eng"]
-
-    lang = "eng+ara" if "ara" in langs else "eng"
-
-    configs = [
-        "--psm 6",
-        "--psm 4",
-        "--psm 11",
+    return [
+        up_gray,
+        up_contrast,
+        sharp,
+        adaptive,
     ]
 
-    results = []
-    for config in configs:
-        try:
-            results.append(pytesseract.image_to_string(processed, lang=lang, config=config))
-        except Exception:
-            pass
-
-    # Longest result is usually the most complete for receipts.
-    return max(results, key=len, default="")
-
-
-def pdf_to_images(data: bytes):
-    """Render every page of a PDF to PIL images."""
-    if not PDF_AVAILABLE:
-        raise RuntimeError("PDF support requires PyMuPDF (pip install pymupdf).")
-
-    document = fitz.open(stream=data, filetype="pdf")
-    images = []
-
-    for page in document:
-        pix = page.get_pixmap(matrix=fitz.Matrix(2.5, 2.5), alpha=False)
-        img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
-        images.append(img)
-
-    return images
-
 
 # ---------------------------------------------------------------------
-# Parsing helpers
+# OCR
 # ---------------------------------------------------------------------
 
-MONEY_RE = r"(?:[$€£¥₩﷼]|SAR|SR|ر\.?س\.?|﷼)?\s*([0-9]+(?:[.,][0-9]{1,2})?)"
+ASCII_RE = re.compile(r"[^\x00-\x7F]+")
 
 
-def money_to_float(value):
-    if value is None:
-        return None
-
-    s = str(value).strip()
-    s = s.replace(",", "")
-
-    # Keep only the numeric portion.
-    match = re.search(r"-?\d+(?:\.\d+)?", s)
-    if not match:
-        return None
-
-    try:
-        return float(match.group())
-    except ValueError:
-        return None
-
-
-def normalize_text(text):
-    text = text.replace("\r", "\n")
-    text = text.replace("\u00a0", " ")
+def clean_english(text: str) -> str:
+    """
+    Remove Arabic/non-ASCII OCR output while retaining English, numbers,
+    punctuation and currency-independent receipt information.
+    """
+    text = ASCII_RE.sub(" ", text)
     text = re.sub(r"[ \t]+", " ", text)
-    text = re.sub(r"\n{3,}", "\n\n", text)
     return text.strip()
 
 
-def first_match(patterns, text, flags=re.I | re.M):
-    for pattern in patterns:
-        m = re.search(pattern, text, flags)
-        if m:
-            return m.group(1).strip()
-    return None
+def run_ocr(engine: RapidOCR, image: np.ndarray) -> tuple[str, float]:
+    result, _ = engine(image)
 
+    if not result:
+        return "", 0.0
 
-def parse_date(text):
-    patterns = [
-        r"(\d{4}/\d{2}/\d{2})\s+\d{1,2}:\d{2}:\d{2}\s*(?:AM|PM)?",
-        r"(\d{4}-\d{2}-\d{2})",
-        r"(\d{4}/\d{2}/\d{2})",
-    ]
+    pieces: list[str] = []
+    scores: list[float] = []
 
-    value = first_match(patterns, text)
-    if not value:
-        return None
-
-    for fmt in ("%Y/%m/%d", "%Y-%m-%d"):
-        try:
-            return datetime.strptime(value, fmt).date()
-        except ValueError:
+    for row in result:
+        # RapidOCR returns [box, text, confidence].
+        if len(row) < 3:
             continue
 
+        text = clean_english(str(row[1]))
+        try:
+            score = float(row[2])
+        except Exception:
+            score = 0.0
+
+        if text:
+            pieces.append(text)
+            scores.append(score)
+
+    return "\n".join(pieces), (float(np.mean(scores)) if scores else 0.0)
+
+
+def score_ocr_text(text: str, confidence: float) -> float:
+    """
+    Prefer OCR variants that both have good confidence and contain
+    invoice-specific anchor words.
+    """
+    low = text.lower()
+
+    anchors = [
+        "total", "subtotal", "vat", "printed", "order",
+        "check", "customer", "price", "qty", "restaurant",
+    ]
+    anchor_hits = sum(1 for a in anchors if a in low)
+
+    # Confidence dominates; anchors break ties.
+    return confidence * 100.0 + anchor_hits * 3.0 + min(len(text), 3000) / 3000.0
+
+
+def ocr_image(image_bytes: bytes) -> tuple[str, float, np.ndarray]:
+    arr = np.frombuffer(image_bytes, dtype=np.uint8)
+    image = cv2.imdecode(arr, cv2.IMREAD_COLOR)
+
+    if image is None:
+        raise ValueError("Could not decode the image.")
+
+    corrected = four_point_warp(image)
+    variants = make_ocr_variants(corrected)
+
+    engine = get_ocr_engine()
+
+    best_text = ""
+    best_conf = 0.0
+    best_score = -1.0
+
+    for variant in variants:
+        text, conf = run_ocr(engine, variant)
+        score = score_ocr_text(text, conf)
+
+        if score > best_score:
+            best_score = score
+            best_text = text
+            best_conf = conf
+
+    return best_text, best_conf, corrected
+
+
+# ---------------------------------------------------------------------
+# Structured extraction
+# ---------------------------------------------------------------------
+
+DATE_RE = re.compile(r"\b(20\d{2})[/-](\d{1,2})[/-](\d{1,2})\b")
+AMOUNT_RE = re.compile(
+    r"(?<!\d)(\d{1,3}(?:,\d{3})*\.\d{2}|\d+\.\d{2})(?!\d)"
+)
+
+
+def normalize_amount(value: str) -> float:
+    return float(value.replace(",", ""))
+
+
+def amounts_in(line: str) -> list[float]:
+    return [normalize_amount(x) for x in AMOUNT_RE.findall(line)]
+
+
+def first_date(text: str) -> str | None:
+    m = DATE_RE.search(text)
+    if not m:
+        return None
+    y, mo, d = m.groups()
+    return f"{int(y):04d}-{int(mo):02d}-{int(d):02d}"
+
+
+def extract_after_label(lines: list[str], labels: list[str]) -> str | None:
+    for i, line in enumerate(lines):
+        low = line.lower()
+        for label in labels:
+            if label in low:
+                # Prefer content after the label on the same line.
+                parts = re.split(re.escape(label), line, maxsplit=1, flags=re.I)
+                if len(parts) == 2:
+                    value = parts[1].strip(" :#-")
+                    if value:
+                        return value
+
+                # Otherwise inspect the next line.
+                if i + 1 < len(lines):
+                    value = lines[i + 1].strip()
+                    if value:
+                        return value
     return None
 
 
-def parse_invoice(text, filename):
-    text = normalize_text(text)
-
-    invoice = {
-        "filename": filename,
-        "invoice_date": parse_date(text),
-        "order_number": None,
-        "check_number": None,
-        "vat_number": None,
-        "customer": None,
-        "creator": None,
-        "closer": None,
-        "service_type": None,
-        "subtotal": None,
-        "vat": None,
-        "total": None,
-        "payment": None,
-        "products_count": None,
-        "eat_number": None,
-        "currency": None,
-        "raw_text": text,
-    }
-
-    invoice["order_number"] = first_match(
-        [
-            r"Order\s*#\s*([A-Za-z0-9-]+)",
-            r"Order\s*No\.?\s*[:#]?\s*([A-Za-z0-9-]+)",
-        ],
-        text,
-    )
-
-    invoice["check_number"] = first_match(
-        [
-            r"Check\s*#\s*([A-Za-z0-9-]+)",
-            r"Check\s*No\.?\s*[:#]?\s*([A-Za-z0-9-]+)",
-        ],
-        text,
-    )
-
-    invoice["vat_number"] = first_match(
-        [
-            r"VAT\s*[:#]?\s*([0-9]{10,20})",
-            r"VAT\s*No\.?\s*[:#]?\s*([0-9]{10,20})",
-        ],
-        text,
-    )
-
-    invoice["customer"] = first_match(
-        [
-            r"Customer\s*:\s*(.+)",
-            r"ustomer\s*:\s*(.+)",
-        ],
-        text,
-    )
-
-    invoice["creator"] = first_match([r"Creator\s*:\s*(.+)"], text)
-    invoice["closer"] = first_match([r"Closer\s*:\s*(.+)"], text)
-
-    invoice["service_type"] = first_match(
-        [
-            r"\b(Drive\s+Thru)\b",
-            r"\b(Dine\s*In)\b",
-            r"\b(Take\s*Away)\b",
-            r"\b(Delivery)\b",
-        ],
-        text,
-    )
-
-    # The sample invoice uses:
-    # Subtotal   120.87
-    # VAT(15.0%) 18.13
-    # Total      139.00
-    invoice["subtotal"] = money_to_float(
-        first_match(
-            [
-                r"Subtotal\s*[:\-]?\s*" + MONEY_RE,
-            ],
-            text,
-        )
-    )
-
-    invoice["vat"] = money_to_float(
-        first_match(
-            [
-                r"VAT\s*\(?\s*\d+(?:\.\d+)?%\s*\)?\s*[:\-]?\s*" + MONEY_RE,
-                r"VAT\s*[:\-]?\s*" + MONEY_RE,
-            ],
-            text,
-        )
-    )
-
-    invoice["total"] = money_to_float(
-        first_match(
-            [
-                r"\bTotal\s*[:\-]?\s*" + MONEY_RE,
-            ],
-            text,
-        )
-    )
-
-    invoice["payment"] = first_match(
-        [
-            r"Payment\s*-\s*(.+)",
-            r"Payment\s*:\s*(.+)",
-        ],
-        text,
-    )
-
-    product_count = first_match(
-        [
-            r"Products\s+Count\s+(\d+)",
-            r"Product\s+Count\s+(\d+)",
-        ],
-        text,
-    )
-    if product_count:
-        invoice["products_count"] = int(product_count)
-
-    invoice["eat_number"] = first_match(
-        [
-            r"Eat\s*No\.?\s*[:#]?\s*([A-Za-z0-9-]+)",
-            r"Ext\s*No\.?\s*[:#]?\s*([A-Za-z0-9-]+)",
-        ],
-        text,
-    )
-
-    # Infer currency symbol from the OCR text where possible.
-    for symbol, code in [
-        ("₩", "KRW"),
-        ("SAR", "SAR"),
-        ("﷼", "SAR"),
-        ("SR", "SAR"),
-        ("$", "USD"),
-        ("€", "EUR"),
-        ("£", "GBP"),
-    ]:
-        if symbol in text:
-            invoice["currency"] = code
-            break
-
-    return invoice
+def extract_labeled_amount(lines: list[str], label: str) -> float | None:
+    for line in lines:
+        if label.lower() in line.lower():
+            vals = amounts_in(line)
+            if vals:
+                return vals[-1]
+    return None
 
 
-# ---------------------------------------------------------------------
-# Item extraction
-# ---------------------------------------------------------------------
+def extract_vat_rate(lines: list[str]) -> float | None:
+    for line in lines:
+        if "vat" in line.lower():
+            m = re.search(r"(\d+(?:\.\d+)?)\s*%", line)
+            if m:
+                return float(m.group(1))
+    return None
 
-def extract_items(text):
+
+def extract_total(lines: list[str]) -> float | None:
+    # "Total" must be checked before "Subtotal".
+    for line in lines:
+        low = line.lower()
+        if "total" in low and "subtotal" not in low:
+            vals = amounts_in(line)
+            if vals:
+                return vals[-1]
+    return None
+
+
+def extract_items(lines: list[str]) -> list[dict[str, Any]]:
     """
-    Attempts to identify receipt item lines.
-
-    Typical sample:
-        2  Tandoori flavor Chicken Pizza   90.00
-        1  GRILLED CHICKEN BREAST          49.00
-
-    The parser deliberately stops at subtotal/VAT/total lines.
+    Extract receipt lines shaped approximately like:
+      2 CHICKEN & PINEAPPLE PIZZA LARGE 96.00
     """
-    lines = [x.strip() for x in text.splitlines() if x.strip()]
     items = []
 
-    stop_words = re.compile(
-        r"^(Subtotal|VAT|Total|Payment|Official|Products?\s+Count|Thank|Eat\s+No|Ext\s+No)",
-        re.I,
-    )
-
-    # quantity + description + price
-    pattern = re.compile(
-        r"^(\d+)\s+(.+?)\s+(?:[$€£¥₩﷼]|SAR|SR|ر\.?س\.?|﷼)?\s*"
-        r"(\d+(?:[.,]\d{1,2})?)\s*$",
-        re.I,
-    )
-
-    in_items = False
-
     for line in lines:
-        if re.search(r"\bQty\b.*\bItem\b", line, re.I):
-            in_items = True
+        cleaned = line.strip()
+        low = cleaned.lower()
+
+        if any(
+            x in low
+            for x in [
+                "subtotal", "vat", "total", "payment", "products count",
+                "printed", "creator", "closer", "customer", "order",
+                "check", "invoice", "tax invoice", "thank you",
+            ]
+        ):
             continue
 
-        if not in_items:
+        # Qty + description + amount.
+        m = re.match(
+            r"^\s*(\d+)\s+(.+?)\s+"
+            r"(\d{1,3}(?:,\d{3})*\.\d{2}|\d+\.\d{2})\s*$",
+            cleaned,
+            flags=re.I,
+        )
+        if not m:
             continue
 
-        if stop_words.search(line):
-            break
+        qty = int(m.group(1))
+        description = clean_english(m.group(2)).strip()
+        amount = normalize_amount(m.group(3))
 
-        m = pattern.match(line)
-        if m:
-            qty = int(m.group(1))
-            description = m.group(2).strip(" -:")
-            price = money_to_float(m.group(3))
-
+        if description:
             items.append(
                 {
-                    "quantity": qty,
+                    "qty": qty,
                     "item": description,
-                    "price": price,
-                    "line_total": round(qty * price, 2) if price is not None else None,
+                    "line_total": amount,
                 }
             )
 
     return items
 
 
+def parse_invoice(raw_text: str, confidence: float) -> dict[str, Any]:
+    lines = [x.strip() for x in raw_text.splitlines() if x.strip()]
+
+    # Normalize OCR spacing without changing useful punctuation.
+    lines = [re.sub(r"\s+", " ", x) for x in lines]
+
+    invoice_date = first_date(raw_text)
+
+    printed_at = None
+    for line in lines:
+        if "printed at" in line.lower():
+            m = re.search(
+                r"(20\d{2}[/-]\d{1,2}[/-]\d{1,2})\s+"
+                r"(\d{1,2}:\d{2}(?::\d{2})?\s*(?:AM|PM)?)?",
+                line,
+                flags=re.I,
+            )
+            if m:
+                printed_at = " ".join(x for x in m.groups() if x)
+                break
+
+    merchant = None
+    for line in lines:
+        low = line.lower()
+        if "real estate investment company" in low:
+            merchant = line
+            break
+
+    vat_number = None
+    for line in lines:
+        if "vat:" in line.lower() or re.search(r"\bvat\b", line.lower()):
+            m = re.search(r"\b(\d{10,20})\b", line.replace(" ", ""))
+            if m:
+                vat_number = m.group(1)
+                break
+
+    order_number = None
+    for line in lines:
+        m = re.search(r"order\s*#?\s*(\d+)", line, flags=re.I)
+        if m:
+            order_number = m.group(1)
+            break
+
+    check_number = None
+    for line in lines:
+        m = re.search(r"check\s*#?\s*(\d+)", line, flags=re.I)
+        if m:
+            check_number = m.group(1)
+            break
+
+    creator = extract_after_label(lines, ["creator"])
+    closer = extract_after_label(lines, ["closer"])
+    customer = extract_after_label(lines, ["customer"])
+
+    payment_method = None
+    for line in lines:
+        if "payment" in line.lower():
+            payment_method = re.sub(
+                r"^\s*payment\s*[-:]*\s*",
+                "",
+                line,
+                flags=re.I,
+            ).strip()
+            break
+
+    subtotal = extract_labeled_amount(lines, "subtotal")
+    vat_amount = extract_labeled_amount(lines, "vat")
+    total_amount = extract_total(lines)
+    vat_rate = extract_vat_rate(lines)
+
+    products_count = None
+    for line in lines:
+        m = re.search(r"products?\s*count\s*(\d+)", line, flags=re.I)
+        if m:
+            products_count = int(m.group(1))
+            break
+
+    items = extract_items(lines)
+
+    # If product count wasn't recognized, use the sum of quantities.
+    if products_count is None and items:
+        products_count = sum(x["qty"] for x in items)
+
+    # Basic consistency recovery:
+    # if total was missed but subtotal + VAT exists, calculate it.
+    if total_amount is None and subtotal is not None and vat_amount is not None:
+        total_amount = round(subtotal + vat_amount, 2)
+
+    return {
+        "invoice_date": invoice_date,
+        "printed_at": printed_at,
+        "merchant": merchant,
+        "vat_number": vat_number,
+        "order_number": order_number,
+        "check_number": check_number,
+        "customer": customer,
+        "creator": creator,
+        "closer": closer,
+        "subtotal": subtotal,
+        "vat_rate": vat_rate,
+        "vat_amount": vat_amount,
+        "total_amount": total_amount,
+        "payment_method": payment_method,
+        "products_count": products_count,
+        "items_json": json.dumps(items, ensure_ascii=False),
+        "raw_ocr_text": raw_text,
+        "ocr_confidence": round(confidence, 4),
+        "status": "OK" if total_amount is not None else "REVIEW",
+        "error_message": None,
+    }
+
+
 # ---------------------------------------------------------------------
 # File handling
 # ---------------------------------------------------------------------
 
-def read_uploaded_file(uploaded_file):
-    suffix = Path(uploaded_file.name).suffix.lower()
+def sha256_bytes(data: bytes) -> str:
+    return hashlib.sha256(data).hexdigest()
+
+
+def save_original_image(file_hash: str, file_name: str, data: bytes) -> Path:
+    safe_name = re.sub(r"[^A-Za-z0-9_.-]+", "_", file_name)
+    path = IMAGE_DIR / f"{file_hash[:12]}_{safe_name}"
+    if not path.exists():
+        path.write_bytes(data)
+    return path
+
+
+def process_one_file(uploaded_file) -> dict[str, Any]:
     data = uploaded_file.getvalue()
+    file_hash = sha256_bytes(data)
 
-    if suffix in {".jpg", ".jpeg", ".png", ".webp", ".bmp", ".tif", ".tiff"}:
-        return [Image.open(io.BytesIO(data)).convert("RGB")]
+    record = {
+        "file_hash": file_hash,
+        "file_name": uploaded_file.name,
+        "processed_at": datetime.now().isoformat(timespec="seconds"),
+    }
 
-    if suffix == ".pdf":
-        return pdf_to_images(data)
+    save_original_image(file_hash, uploaded_file.name, data)
 
-    raise ValueError(f"Unsupported file type: {suffix}")
+    raw_text, confidence, _ = ocr_image(data)
+    record.update(parse_invoice(raw_text, confidence))
 
-
-def expand_zip(uploaded_file):
-    """Return [(filename, bytes), ...] for images/PDFs contained in a ZIP."""
-    output = []
-    with zipfile.ZipFile(io.BytesIO(uploaded_file.getvalue())) as z:
-        for name in z.namelist():
-            if name.endswith("/"):
-                continue
-
-            suffix = Path(name).suffix.lower()
-            if suffix in {
-                ".jpg", ".jpeg", ".png", ".webp",
-                ".bmp", ".tif", ".tiff", ".pdf"
-            }:
-                output.append((name, z.read(name)))
-
-    return output
+    return record
 
 
 # ---------------------------------------------------------------------
-# Streamlit interface
+# Streamlit UI
 # ---------------------------------------------------------------------
 
-with st.sidebar:
-    st.header("Settings")
+st.set_page_config(
+    page_title="Invoice OCR Database",
+    page_icon="🧾",
+    layout="wide",
+)
 
-    current_year = datetime.now().year
-    selected_year = st.number_input(
-        "Year-to-date year",
-        min_value=2000,
-        max_value=2100,
-        value=current_year,
-        step=1,
-    )
+init_db()
 
-    show_raw = st.checkbox("Show OCR text", value=False)
-    show_items = st.checkbox("Show extracted items", value=True)
+st.title("🧾 Invoice OCR Database")
+st.caption(
+    "Upload all invoice photos at once. They are processed sequentially, "
+    "and the database/summary is updated after every photo."
+)
 
-    st.info(
-        "For best OCR accuracy, use clear photos/scans of the complete receipt. "
-        "The parser is tuned to the restaurant receipt layout shown in your sample."
-    )
-
-uploaded = st.file_uploader(
-    "Upload invoices",
-    type=[
-        "jpg", "jpeg", "png", "webp", "bmp", "tif", "tiff",
-        "pdf", "zip"
-    ],
+uploaded_files = st.file_uploader(
+    "Select invoice photos",
+    type=["jpg", "jpeg", "png", "webp"],
     accept_multiple_files=True,
+    help="All selected photos are loaded together, but OCR runs one image at a time.",
 )
 
-if not uploaded:
-    st.markdown(
-        """
-        ### What this app does
-
-        Upload all your restaurant invoices together. The application will:
-
-        1. OCR each invoice.
-        2. Extract the invoice date, order/check numbers, customer, items,
-           subtotal, VAT and total.
-        3. Compile everything into one table.
-        4. Calculate year-to-date subtotal, VAT and total.
-        5. Allow the consolidated data to be downloaded as CSV/Excel.
-
-        You can upload individual receipt photos, PDFs, or a ZIP containing receipts.
-        """
+col1, col2 = st.columns([1, 3])
+with col1:
+    process_clicked = st.button(
+        "▶ Process invoices",
+        type="primary",
+        disabled=not uploaded_files,
+        use_container_width=True,
     )
-    st.stop()
+with col2:
+    if uploaded_files:
+        st.info(f"{len(uploaded_files)} photo(s) loaded and ready.")
 
+summary_placeholder = st.empty()
+progress_placeholder = st.empty()
+message_placeholder = st.empty()
 
-files_to_process = []
-
-for uploaded_file in uploaded:
-    suffix = Path(uploaded_file.name).suffix.lower()
-
-    if suffix == ".zip":
-        try:
-            for name, data in expand_zip(uploaded_file):
-                files_to_process.append((name, data))
-        except Exception as exc:
-            st.error(f"Could not read ZIP file {uploaded_file.name}: {exc}")
-    else:
-        files_to_process.append((uploaded_file.name, uploaded_file.getvalue()))
-
-
-invoice_records = []
-item_records = []
-
-progress = st.progress(0)
-status = st.empty()
-
-for index, (filename, data) in enumerate(files_to_process, start=1):
-    status.write(f"Processing {index}/{len(files_to_process)}: {filename}")
-
-    try:
-        suffix = Path(filename).suffix.lower()
-
-        if suffix == ".pdf":
-            images = pdf_to_images(data)
-        else:
-            images = [Image.open(io.BytesIO(data)).convert("RGB")]
-
-        # One PDF can contain multiple invoice pages.
-        for page_number, image in enumerate(images, start=1):
-            page_name = (
-                filename if len(images) == 1
-                else f"{filename} — page {page_number}"
-            )
-
-            text = ocr_image(image)
-            record = parse_invoice(text, page_name)
-
-            # If a field is missing from OCR, calculate it where possible.
-            if record["total"] is None and record["subtotal"] is not None and record["vat"] is not None:
-                record["total"] = round(record["subtotal"] + record["vat"], 2)
-
-            if record["subtotal"] is None and record["total"] is not None and record["vat"] is not None:
-                record["subtotal"] = round(record["total"] - record["vat"], 2)
-
-            invoice_records.append(record)
-
-            for item in extract_items(text):
-                item["filename"] = page_name
-                item_records.append(item)
-
-            if show_raw:
-                with st.expander(f"OCR: {page_name}"):
-                    st.text(text)
-
-    except Exception as exc:
-        st.error(f"Could not process {filename}: {exc}")
-
-    progress.progress(index / max(len(files_to_process), 1))
-
-status.empty()
-
-if not invoice_records:
-    st.warning("No invoices could be extracted.")
-    st.stop()
-
-
-df = pd.DataFrame(invoice_records)
-
-# Ensure date column is a real datetime column.
-df["invoice_date"] = pd.to_datetime(df["invoice_date"], errors="coerce")
-
-# Sort chronologically.
-df = df.sort_values(["invoice_date", "filename"], na_position="last").reset_index(drop=True)
-
-# ---------------------------------------------------------------------
-# Year-to-date calculation
-# ---------------------------------------------------------------------
-
-today = pd.Timestamp.today().normalize()
-start_of_year = pd.Timestamp(year=int(selected_year), month=1, day=1)
-
-if int(selected_year) == today.year:
-    ytd_end = today
-else:
-    ytd_end = pd.Timestamp(year=int(selected_year), month=12, day=31)
-
-ytd_mask = (
-    df["invoice_date"].notna()
-    & (df["invoice_date"] >= start_of_year)
-    & (df["invoice_date"] <= ytd_end)
-)
-
-ytd = df.loc[ytd_mask].copy()
-
-invoice_count = len(ytd)
-subtotal_ytd = pd.to_numeric(ytd["subtotal"], errors="coerce").sum()
-vat_ytd = pd.to_numeric(ytd["vat"], errors="coerce").sum()
-total_ytd = pd.to_numeric(ytd["total"], errors="coerce").sum()
-
-# ---------------------------------------------------------------------
-# Dashboard
-# ---------------------------------------------------------------------
-
-st.subheader(f"Year-to-date summary — {selected_year}")
-
-c1, c2, c3, c4 = st.columns(4)
-
-c1.metric("Invoices", f"{invoice_count:,}")
-c2.metric("Subtotal", f"{subtotal_ytd:,.2f}")
-c3.metric("VAT", f"{vat_ytd:,.2f}")
-c4.metric("Total", f"{total_ytd:,.2f}")
-
-if invoice_count:
-    st.caption(
-        f"YTD period: {start_of_year.date()} through {ytd_end.date()}. "
-        "Only invoices whose extracted invoice date falls within this period are included."
-    )
-else:
-    st.warning(
-        "No invoice dates were successfully extracted for the selected YTD period. "
-        "Check the OCR text below or use clearer receipt images."
-    )
-
-
-# ---------------------------------------------------------------------
-# Invoice table
-# ---------------------------------------------------------------------
-
-st.subheader("All extracted invoices")
-
-display_columns = [
-    "invoice_date",
-    "filename",
-    "order_number",
-    "check_number",
-    "customer",
-    "service_type",
-    "subtotal",
-    "vat",
-    "total",
-    "payment",
-    "products_count",
-]
-
-available_columns = [c for c in display_columns if c in df.columns]
-
-st.dataframe(
-    df[available_columns],
+# Always show the current database.
+summary_placeholder.dataframe(
+    load_summary(),
     use_container_width=True,
     hide_index=True,
 )
 
+if process_clicked and uploaded_files:
+    progress = progress_placeholder.progress(0)
+    results_box = st.container()
 
-# ---------------------------------------------------------------------
-# Items
-# ---------------------------------------------------------------------
+    for index, uploaded_file in enumerate(uploaded_files, start=1):
+        message_placeholder.info(
+            f"Processing {index}/{len(uploaded_files)}: **{uploaded_file.name}**"
+        )
 
-if show_items and item_records:
-    st.subheader("Extracted items")
-    items_df = pd.DataFrame(item_records)
-    st.dataframe(items_df, use_container_width=True, hide_index=True)
+        try:
+            record = process_one_file(uploaded_file)
 
+            inserted = save_invoice(record)
 
-# ---------------------------------------------------------------------
-# Missing / suspicious fields
-# ---------------------------------------------------------------------
-
-st.subheader("OCR quality checks")
-
-checks = []
-
-for _, row in df.iterrows():
-    problems = []
-
-    if pd.isna(row["invoice_date"]):
-        problems.append("date missing")
-
-    if pd.isna(row["subtotal"]):
-        problems.append("subtotal missing")
-
-    if pd.isna(row["total"]):
-        problems.append("total missing")
-
-    if pd.notna(row["subtotal"]) and pd.notna(row["vat"]) and pd.notna(row["total"]):
-        expected = round(float(row["subtotal"]) + float(row["vat"]), 2)
-        if abs(expected - float(row["total"])) > 0.02:
-            problems.append(
-                f"subtotal + VAT ≠ total ({expected:.2f} vs {float(row['total']):.2f})"
+            # Immediately refresh the table after this ONE image.
+            current = load_summary()
+            summary_placeholder.dataframe(
+                current,
+                use_container_width=True,
+                hide_index=True,
             )
 
-    if problems:
-        checks.append(
-            {
-                "filename": row["filename"],
-                "issues": "; ".join(problems),
+            if inserted:
+                status = record["status"]
+                total = record.get("total_amount")
+                date = record.get("invoice_date")
+
+                with results_box:
+                    if status == "OK":
+                        st.success(
+                            f"Processed **{uploaded_file.name}** — "
+                            f"date: `{date or 'not found'}` — "
+                            f"total: `{total if total is not None else 'not found'}`"
+                        )
+                    else:
+                        st.warning(
+                            f"Processed **{uploaded_file.name}**, but the total "
+                            "could not be confidently extracted. Marked REVIEW."
+                        )
+            else:
+                with results_box:
+                    st.info(
+                        f"Skipped duplicate: **{uploaded_file.name}** "
+                        "(same file hash already exists in the database)."
+                    )
+
+        except Exception as exc:
+            # Still record the failed image so it is visible in the database.
+            failed = {
+                **record,
+                "invoice_date": None,
+                "printed_at": None,
+                "merchant": None,
+                "vat_number": None,
+                "order_number": None,
+                "check_number": None,
+                "customer": None,
+                "creator": None,
+                "closer": None,
+                "subtotal": None,
+                "vat_rate": None,
+                "vat_amount": None,
+                "total_amount": None,
+                "payment_method": None,
+                "products_count": None,
+                "items_json": "[]",
+                "raw_ocr_text": "",
+                "ocr_confidence": 0.0,
+                "status": "ERROR",
+                "error_message": str(exc),
             }
-        )
+            save_invoice(failed)
 
-if checks:
-    st.dataframe(pd.DataFrame(checks), use_container_width=True, hide_index=True)
-else:
-    st.success("No obvious date/subtotal/VAT/total inconsistencies were detected.")
+            summary_placeholder.dataframe(
+                load_summary(),
+                use_container_width=True,
+                hide_index=True,
+            )
 
+            with results_box:
+                st.error(f"Failed: {uploaded_file.name}: {exc}")
 
-# ---------------------------------------------------------------------
-# Monthly YTD summary
-# ---------------------------------------------------------------------
+        progress.progress(index / len(uploaded_files))
 
-if not ytd.empty:
-    st.subheader("Monthly YTD summary")
-
-    monthly = (
-        ytd.assign(month=ytd["invoice_date"].dt.to_period("M").astype(str))
-        .groupby("month", as_index=False)
-        .agg(
-            invoices=("filename", "count"),
-            subtotal=("subtotal", "sum"),
-            vat=("vat", "sum"),
-            total=("total", "sum"),
-        )
+    message_placeholder.success(
+        f"Finished processing {len(uploaded_files)} photo(s)."
     )
 
-    st.dataframe(monthly, use_container_width=True, hide_index=True)
-
-
 # ---------------------------------------------------------------------
-# Downloads
+# Database export
 # ---------------------------------------------------------------------
 
-st.subheader("Export")
+st.divider()
+st.subheader("Database export")
 
-csv_data = df.to_csv(index=False).encode("utf-8-sig")
+summary = load_summary()
 
-st.download_button(
-    "Download all invoices as CSV",
-    data=csv_data,
-    file_name="restaurant_invoices_all.csv",
-    mime="text/csv",
-)
-
-if item_records:
-    items_csv = pd.DataFrame(item_records).to_csv(index=False).encode("utf-8-sig")
+if not summary.empty:
+    csv_data = summary.to_csv(index=False).encode("utf-8-sig")
     st.download_button(
-        "Download extracted items as CSV",
-        data=items_csv,
-        file_name="restaurant_invoice_items.csv",
+        "Download invoice summary CSV",
+        data=csv_data,
+        file_name="invoice_summary.csv",
         mime="text/csv",
     )
 
-# Excel export is optional and requires openpyxl.
-try:
-    import openpyxl
-
-    excel_buffer = io.BytesIO()
-
-    with pd.ExcelWriter(excel_buffer, engine="openpyxl") as writer:
-        df.to_excel(writer, sheet_name="Invoices", index=False)
-
-        if item_records:
-            pd.DataFrame(item_records).to_excel(
-                writer,
-                sheet_name="Items",
-                index=False,
-            )
-
-        if not ytd.empty:
-            monthly.to_excel(
-                writer,
-                sheet_name="Monthly YTD",
-                index=False,
-            )
-
-        pd.DataFrame(
-            [
-                ["YTD year", int(selected_year)],
-                ["Invoice count", invoice_count],
-                ["Subtotal", round(subtotal_ytd, 2)],
-                ["VAT", round(vat_ytd, 2)],
-                ["Total", round(total_ytd, 2)],
-            ],
-            columns=["Metric", "Value"],
-        ).to_excel(writer, sheet_name="YTD Summary", index=False)
-
-    st.download_button(
-        "Download Excel workbook",
-        data=excel_buffer.getvalue(),
-        file_name="restaurant_invoice_consolidated.xlsx",
-        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    st.caption(
+        f"SQLite database: {DB_PATH}  |  "
+        f"Stored invoice photos: {IMAGE_DIR}"
     )
 
-except Exception:
-    st.info("Install openpyxl to enable Excel export.")
-
-
-# ---------------------------------------------------------------------
-# Important note
-# ---------------------------------------------------------------------
-
+st.divider()
 st.caption(
-    "OCR results should be reviewed against the original receipts before using "
-    "the figures for accounting, tax, reimbursement, or legal purposes."
+    "OCR engine: RapidOCR/ONNX. Arabic OCR output is discarded; English, "
+    "numbers and receipt punctuation are retained."
 )
