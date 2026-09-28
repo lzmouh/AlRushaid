@@ -40,11 +40,6 @@ st.caption(
 # ---------------------------------------------------------------------
 
 def configure_tesseract():
-    \"\"
-    Streamlit Community Cloud installs system packages from packages.txt.
-    This function also checks common Linux locations so the app gives a
-    useful error if Tesseract was not installed.
-    \"\"
     candidates = [
         os.environ.get("TESSERACT_CMD"),
         shutil.which("tesseract"),
