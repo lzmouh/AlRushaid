@@ -11,6 +11,8 @@ import pandas as pd
 import streamlit as st
 from PIL import Image, ImageOps, ImageEnhance
 import pytesseract
+import shutil
+import os
 
 # Optional PDF support
 try:
@@ -36,6 +38,39 @@ st.caption(
 # ---------------------------------------------------------------------
 # OCR / image preparation
 # ---------------------------------------------------------------------
+
+def configure_tesseract():
+    \"\"
+    Streamlit Community Cloud installs system packages from packages.txt.
+    This function also checks common Linux locations so the app gives a
+    useful error if Tesseract was not installed.
+    \"\"
+    candidates = [
+        os.environ.get("TESSERACT_CMD"),
+        shutil.which("tesseract"),
+        "/usr/bin/tesseract",
+        "/usr/local/bin/tesseract",
+    ]
+
+    for candidate in candidates:
+        if candidate and Path(candidate).exists():
+            pytesseract.pytesseract.tesseract_cmd = candidate
+            return candidate
+
+    return None
+
+
+TESSERACT_PATH = configure_tesseract()
+
+if not TESSERACT_PATH:
+    st.error(
+        "Tesseract OCR is not installed. "
+        "For Streamlit Community Cloud, make sure the project contains "
+        "a packages.txt file with 'tesseract-ocr' and 'tesseract-ocr-ara', "
+        "then redeploy/reboot the app."
+    )
+    st.stop()
+
 
 def preprocess_image(image: Image.Image) -> Image.Image:
     """Prepare a receipt image for OCR."""
@@ -74,7 +109,11 @@ def ocr_image(image: Image.Image) -> str:
     processed = preprocess_image(image)
 
     # Use English + Arabic when Arabic Tesseract data is available.
-    langs = pytesseract.get_languages(config="")
+    try:
+        langs = pytesseract.get_languages(config="")
+    except Exception:
+        langs = ["eng"]
+
     lang = "eng+ara" if "ara" in langs else "eng"
 
     configs = [
